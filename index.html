@@ -225,6 +225,13 @@ const ROLE_LABELS = {
 const SUBSCRIPTION_PRICE_DEFAULT = 10000; // NGN, configurable by Super Admin (§7)
 const PAYMENT_DEFAULT = { method:"MoniePoint", accountName:"Wisdom Ebube Daniel", accountNumber:"9041498427" };
 
+// Bootstrap Super Admin accounts. When one of these Firebase Authentication
+// users signs in, the matching platformAdmins/{uid} document is created or
+// repaired automatically. Keep this list restricted to trusted admin emails.
+const BOOTSTRAP_SUPER_ADMIN_EMAILS = [
+  "wisdomebubedaniel2009@gmail.com"
+];
+
 /* =====================================================================
    2. GLOBAL STATE
    ===================================================================== */
@@ -412,7 +419,27 @@ window.addEventListener("hashchange", ()=>{
 /* =====================================================================
    7. AUTH FLOWS
    ===================================================================== */
+async function ensurePlatformAdminRecord(user){
+  if (!user?.uid || !user.email) return;
+  const email = user.email.trim().toLowerCase();
+  if (!BOOTSTRAP_SUPER_ADMIN_EMAILS.includes(email)) return;
+
+  // merge:true preserves any existing platform-admin fields while repairing
+  // the fields required for the Super Admin role.
+  await setDoc(doc(db,"platformAdmins", user.uid), {
+    uid: user.uid,
+    email: user.email,
+    level: "super",
+    status: "active",
+    updatedAt: serverTimestamp()
+  }, { merge:true });
+}
+
 async function loadUserContext(){
+  // Automatically create/repair the platform admin profile for a configured
+  // bootstrap Super Admin immediately after Firebase Authentication succeeds.
+  await ensurePlatformAdminRecord(State.user);
+
   const uSnap = await getDoc(doc(db,"platformAdmins", State.user.uid));
   State.platformAdmin = uSnap.exists() ? uSnap.data() : null;
 
