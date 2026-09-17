@@ -457,7 +457,7 @@ onAuthStateChanged(auth, async (u)=>{
     State.activeSchool=null; State.activeMembership=null; navigate("login"); return; }
   navigate("loading");
   try{ await loadUserContext(); }
-  catch(e){ console.error(e); toast("Failed to load your account. Try again."); navigate("login"); }
+  catch(e){ console.error("Report X error:", e); toast(authErrorMessage(e)); navigate("login"); }
 });
 
 async function doLogin(email, password, btn){
@@ -480,9 +480,16 @@ function authErrorMessage(e){
     "auth/invalid-credential":"Incorrect email or password.",
     "auth/email-already-in-use":"An account with that email already exists.",
     "auth/weak-password":"Password should be at least 6 characters.",
-    "auth/network-request-failed":"Network error — check your connection."
+    "auth/network-request-failed":"Network error — check your connection.",
+    "auth/operation-not-allowed":"Email/Password sign-in isn't enabled for this Firebase project yet (Firebase Console → Authentication → Sign-in method → enable Email/Password).",
+    "auth/too-many-requests":"Too many attempts — please wait a moment and try again.",
+    "permission-denied":"Permission denied by Firestore rules. Make sure the latest firestore.rules have been deployed to this exact project.",
+    "unavailable":"Firestore is unreachable — check your connection, or that a Firestore Database has been created for this project."
   };
-  return map[e.code] || "Something went wrong. Please try again.";
+  if (map[e.code]) return map[e.code];
+  // Surface the raw code/message instead of a generic string so real
+  // misconfiguration (rules not deployed, auth provider off, wrong project, etc.) is visible.
+  return (e.code ? `[${e.code}] ` : "") + (e.message || "Unknown error — check the browser console for details.");
 }
 
 /* =====================================================================
@@ -515,10 +522,93 @@ function viewLogin(){
     el("div",{style:"display:flex;justify-content:space-between;margin-top:12px"},[
       forgot,
       el("a",{style:"font-size:12px;cursor:pointer", onclick:()=>navigate("registerSchool")},"Register your school")
+    ]),
+    el("div",{style:"text-align:center;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)"},[
+      el("a",{style:"font-size:12px;cursor:pointer;font-weight:700", onclick:()=>navigate("redeemInvite")},"Have a school code + invite code? Join as Teacher/Parent →")
     ])
   );
   wrap.appendChild(card);
   return wrap;
+}
+
+/* =====================================================================
+   INVITE REDEMPTION — Teacher / Parent / Registrar join via School Code +
+   Invitation Code (§83: invitations are scoped, tied to a role/school,
+   and never grant unrestricted access by themselves).
+   ===================================================================== */
+function genInviteCode(){
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let c = ""; for (let i=0;i<8;i++) c += chars[Math.floor(Math.random()*chars.length)];
+  return c;
+}
+function viewRedeemInvite(){
+  const wrap = el("div",{class:"center-screen"});
+  const card = el("div",{class:"card auth-card"});
+  const isLoggedIn = !!State.user;
+  const schoolCode = el("input",{type:"text", placeholder:"e.g. RX-7K2M9P", style:"text-transform:uppercase"});
+  const inviteCode = el("input",{type:"text", placeholder:"8-character invitation code", style:"text-transform:uppercase"});
+  const nameField = el("input",{type:"text", placeholder:"Full name"});
+  const email = el("input",{type:"email", placeholder:"you@example.com"});
+  const pass = el("input",{type:"password", placeholder:"Choose a password (min 6 chars)"});
+
+  const btn = el("button",{class:"btn", style:"width:100%;margin-top:6px"}, isLoggedIn ? "Join School" : "Create Account & Join");
+  btn.onclick = ()=>redeemInvite({
+    schoolCode: schoolCode.value.trim().toUpperCase(),
+    inviteCode: inviteCode.value.trim().toUpperCase(),
+    name: nameField.value.trim(), email: email.value.trim(), password: pass.value
+  }, btn, isLoggedIn);
+
+  const fields = [
+    el("div",{class:"field"},[el("label",{class:"req"},"School Code"), schoolCode]),
+    el("div",{class:"field"},[el("label",{class:"req"},"Invitation Code"), inviteCode])
+  ];
+  if (!isLoggedIn){
+    fields.push(el("div",{class:"field"},[el("label",{class:"req"},"Full Name"), nameField]));
+    fields.push(el("div",{class:"field"},[el("label",{class:"req"},"Email"), email]));
+    fields.push(el("div",{class:"field"},[el("label",{class:"req"},"Password"), pass]));
+  }
+  card.append(
+    el("div",{style:"text-align:center;margin-bottom:18px"},[
+      el("div",{class:"topbar brand", style:"font-size:24px;justify-content:center;border:none;padding:0"},"Report X"),
+      el("p",{},"Join your school as a Teacher, Parent, or other invited staff using the codes your school gave you.")
+    ]),
+    ...fields,
+    btn,
+    el("div",{style:"text-align:center;margin-top:12px"}, el("a",{style:"font-size:12px;cursor:pointer", onclick:()=>navigate("login")}, "Back to sign in"))
+  );
+  wrap.appendChild(card);
+  return wrap;
+}
+async function redeemInvite({schoolCode, inviteCode, name, email, password}, btn, isLoggedIn){
+  if (!schoolCode || !inviteCode) return toast("Enter the school code and invitation code");
+  if (!isLoggedIn && (!email || password.length<6)) return toast("Enter a valid email and a password of at least 6 characters");
+  btn.disabled = true;
+  try{
+    const schoolSnap = await getDocs(query(col("schools"), where("schoolCode","==",schoolCode)));
+    if (schoolSnap.empty){ toast("No school found with that code"); btn.disabled=false; return; }
+    const school = { id: schoolSnap.docs[0].id, ...schoolSnap.docs[0].data() };
+
+    const invSnap = await getDocs(query(col("schoolInvitations"),
+      where("schoolId","==",school.id), where("code","==",inviteCode), where("used","==",false)));
+    if (invSnap.empty){ toast("Invalid or already-used invitation code"); btn.disabled=false; return; }
+    const invite = { id: invSnap.docs[0].id, ...invSnap.docs[0].data() };
+
+    let user = State.user;
+    if (!isLoggedIn){
+      const cred = await createUserWithEmailAndPassword(auth, email, password);
+      user = cred.user;
+      if (name) await updateProfile(user, { displayName: name });
+    }
+
+    await updateDoc(doc(db,"schoolInvitations",invite.id), { used:true, consumedBy:user.uid, consumedAt: serverTimestamp() });
+    await setDoc(doc(db,"schoolUsers", school.id+"_"+user.uid), {
+      uid: user.uid, schoolId: school.id, role: invite.role, inviteId: invite.id,
+      isOwner:false, isPrincipal:false, status:"active", email: user.email, createdAt: serverTimestamp()
+    });
+    await audit("invite.redeemed", { schoolId: school.id, targetType:"invitation", targetId: invite.id });
+    toast(`Welcome! You've joined ${school.name} as ${ROLE_LABELS[invite.role]}.`);
+    await loadUserContext();
+  }catch(e){ console.error(e); toast(authErrorMessage(e)); btn.disabled=false; }
 }
 
 /* =====================================================================
@@ -854,6 +944,76 @@ async function viewPrincipalDashboard(){
 }
 
 /* =====================================================================
+   12b. STAFF & INVITATIONS (§13 access gate, §83)
+   Owner/Principal generate a one-time School Code + Invitation Code pair;
+   Teachers/Parents/etc. redeem it from the "Have an invite code?" link on
+   the sign-in screen (see viewRedeemInvite above).
+   ===================================================================== */
+async function viewStaff(){
+  const schoolId = State.activeSchoolId;
+  const content = el("div");
+  content.appendChild(el("h2",{},"Staff & Invitations"));
+  content.appendChild(el("p",{},"Generate a code for a Teacher, Parent, Registrar, Vice Principal, or Printer to join your school. Share your School Code and their Invitation Code — they redeem both from the “Have an invite code?” link on the sign-in screen."));
+
+  const roleSel = el("select",{}, ["teacher","parent","registrar","vicePrincipal","printer","principal"].map(r=>el("option",{value:r}, ROLE_LABELS[r])));
+  const genBtn = el("button",{class:"btn sm", onclick:()=>generateInvite()},"Generate Code");
+  content.appendChild(el("div",{class:"card", style:"display:flex;gap:14px;align-items:end;flex-wrap:wrap"},[
+    el("div",{class:"field", style:"margin:0"},[el("label",{},"Role"), roleSel]),
+    genBtn,
+    el("div",{class:"field", style:"margin:0"},[el("label",{},"Your School Code (share this too)"),
+      el("div",{style:"font-weight:800;font-size:18px;letter-spacing:.03em"}, State.activeSchool?.schoolCode||"—")])
+  ]));
+
+  const listWrap = el("div",{style:"margin-top:14px"});
+  content.appendChild(listWrap);
+
+  async function loadInvites(){
+    listWrap.innerHTML = "";
+    listWrap.appendChild(el("div",{class:"skeleton",style:"height:100px"}));
+    const snap = await getDocs(query(col("schoolInvitations"), where("schoolId","==",schoolId), orderBy("createdAt","desc"), limit(30)));
+    const invites = snap.docs.map(d=>({id:d.id,...d.data()}));
+    listWrap.innerHTML = "";
+    if (!invites.length){
+      listWrap.appendChild(el("div",{class:"empty"},[el("div",{class:"big"},"👥"), el("p",{},"No invitations generated yet.")]));
+      return;
+    }
+    const tw = el("div",{class:"card table-wrap"});
+    tw.appendChild(el("table",{},[
+      el("thead",{},el("tr",{},["Role","Code","Status","Created",""].map(h=>el("th",{},h)))),
+      el("tbody",{}, invites.map(i=>el("tr",{},[
+        el("td",{}, ROLE_LABELS[i.role]||i.role),
+        el("td",{style:"font-family:monospace;font-weight:700"}, i.code),
+        el("td",{}, i.used ? el("span",{class:"badge green"},"REDEEMED") : el("span",{class:"badge amber"},"PENDING")),
+        el("td",{}, fmtDate(i.createdAt)),
+        el("td",{}, !i.used ? el("button",{class:"btn sm danger", onclick:()=>revokeInvite(i.id)},"Revoke") : null)
+      ])))
+    ]));
+    listWrap.appendChild(tw);
+  }
+  async function generateInvite(){
+    genBtn.disabled = true;
+    try{
+      const code = genInviteCode();
+      await addDoc(col("schoolInvitations"), { schoolId, role: roleSel.value, code, used:false, createdAt: serverTimestamp(), createdBy: State.user.uid });
+      await audit("invite.created", { schoolId, targetType:"invitation" });
+      toast(`Code generated: ${code}`);
+      await loadInvites();
+    }catch(e){ toast(authErrorMessage(e)); }
+    genBtn.disabled = false;
+  }
+  async function revokeInvite(id){
+    confirmAction("Revoke this invitation code? It can no longer be redeemed.", async ()=>{
+      await deleteDoc(doc(db,"schoolInvitations",id));
+      await audit("invite.revoked", { schoolId, targetType:"invitation", targetId:id });
+      toast("Invitation revoked");
+      await loadInvites();
+    });
+  }
+  await loadInvites();
+  return shell(content);
+}
+
+/* =====================================================================
    13. STUDENTS (Registrar workflow: create -> assign -> Principal approves) (§13,§58)
    ===================================================================== */
 async function viewStudents(){
@@ -1118,7 +1278,8 @@ const routes = {
   reviewResults: viewReviewResults,
   reports: ()=>scaffoldView("Reports","Finalize, preview, print, and download report cards; see the report engine functions in this file."),
   branding: ()=>scaffoldView("School Branding","Logo, motto, official signature/stamp, report colors, and template settings (compressed client-side, no Storage used)."),
-  staff: ()=>scaffoldView("Staff","Invite and manage staff roles for this school."),
+  staff: viewStaff,
+  redeemInvite: viewRedeemInvite,
   subscription: ()=>scaffoldView("Subscription","View status and submit payment proof for Super Admin review.")
 };
 async function render(){
@@ -1129,11 +1290,12 @@ async function render(){
     const result = await view(State.routeParams);
     appRoot.appendChild(result);
   }catch(e){
-    console.error(e);
+    console.error("Report X render error:", e);
     appRoot.appendChild(el("div",{class:"center-screen"},[
-      el("div",{class:"card", style:"text-align:center"},[
+      el("div",{class:"card", style:"text-align:center;max-width:420px"},[
         el("h3",{},"Something went wrong"),
-        el("p",{},"Please try again, or sign out and back in."),
+        el("p",{}, authErrorMessage(e)),
+        el("p",{class:"help"},"Open the browser console (F12) for the full technical error."),
         el("button",{class:"btn", onclick:()=>navigate(roleHomeRoute())},"Go Home")
       ])
     ]));
